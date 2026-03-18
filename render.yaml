@@ -1,0 +1,28 @@
+services:
+  - type: web
+    name: cakemallow-backend
+    runtime: python
+    plan: free
+    pythonVersion: 3.10
+
+    buildCommand: >
+      pip install -r requirements.txt &&
+      python manage.py migrate &&
+      python manage.py collectstatic --noinput
+
+    startCommand: gunicorn cakemallow_backend.wsgi
+
+    envVars:
+      - key: DEBUG
+        value: "False"
+      - key: PYTHON_VERSION
+        value: "3.10"
+      - key: ALLOWED_HOSTS
+        value: "yourdomain.com,www.yourdomain.com,yourdomain.onrender.com"
+
+databases:
+  - name: cakemallow-db
+    databaseName: cakemallow_db
+    user: cakemallow_user
+    region: oregon
+    plan: free
