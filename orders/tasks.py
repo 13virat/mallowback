@@ -60,7 +60,7 @@ def _log_order_analytics_sync(order_id: int):
         order = _get_order(order_id)
 
         items = list(order.items.select_related('product', 'variant').values(
-            'product__name', 'variant__name', 'quantity', 'price'
+            'product__name', 'variant__weight', 'quantity', 'price'
         ))
 
         logger.info(
