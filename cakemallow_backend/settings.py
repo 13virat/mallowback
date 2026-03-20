@@ -114,17 +114,13 @@ REST_FRAMEWORK = {
     ),
     'DEFAULT_PAGINATION_CLASS': 'rest_framework.pagination.PageNumberPagination',
     'PAGE_SIZE': 20,
-    'DEFAULT_THROTTLE_CLASSES': [
-        'rest_framework.throttling.AnonRateThrottle',
-        'rest_framework.throttling.UserRateThrottle',
-    ],
     'DEFAULT_THROTTLE_RATES': {
-        'anon':    '60/hour',
-        'user':    '1000/hour',
+        'anon':    '200/hour',
+        'user':    '2000/hour',
         'payment': '20/hour',
         'otp':     '10/hour',
         'login':   '10/minute',
-        'burst':   '30/minute',
+        'burst':   '60/minute',
     },
     'DEFAULT_RENDERER_CLASSES': ('rest_framework.renderers.JSONRenderer',),
     'EXCEPTION_HANDLER': 'core.exceptions.custom_exception_handler',
@@ -132,7 +128,7 @@ REST_FRAMEWORK = {
 
 # ── JWT ───────────────────────────────────────────────────────────────────────
 SIMPLE_JWT = {
-    'ACCESS_TOKEN_LIFETIME':  timedelta(minutes=15),
+    'ACCESS_TOKEN_LIFETIME':  timedelta(minutes=60),
     'REFRESH_TOKEN_LIFETIME': timedelta(days=7),
     'ROTATE_REFRESH_TOKENS':  True,
     'BLACKLIST_AFTER_ROTATION': True,
