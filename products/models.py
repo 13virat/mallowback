@@ -38,7 +38,7 @@ class Product(models.Model):
         return self.name
 
     def average_rating(self):
-        reviews = self.review_set.all()
+        reviews = self.reviews.all()
         if reviews.exists():
             return round(sum(r.rating for r in reviews) / reviews.count(), 1)
         return None
