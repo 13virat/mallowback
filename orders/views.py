@@ -57,7 +57,6 @@ def create_order(request):
     """
     POST /api/orders/create/
     Creates an order from the user's cart.
-    Validates stock, applies coupon, calculates delivery charge.
     """
     serializer = CreateOrderSerializer(data=request.data)
     if not serializer.is_valid():
@@ -80,19 +79,18 @@ def create_order(request):
     if not cart_items.exists():
         return Response({'error': 'Cart is empty.'}, status=status.HTTP_400_BAD_REQUEST)
 
-    # ── Stock validation BEFORE creating order ──────────────────────────────
+    # Stock validation
     from products.services import check_cart_stock
     stock_errors = check_cart_stock(cart)
     if stock_errors:
         return Response({'error': 'Stock issues', 'details': stock_errors}, status=status.HTTP_400_BAD_REQUEST)
 
-    # ── Pricing ──────────────────────────────────────────────────────────────
-    total = sum(item.variant.price * item.quantity for item in cart_items)
-
-    # Coupon
+    # Pricing
+    total    = sum(item.variant.price * item.quantity for item in cart_items)
     discount = 0
-    coupon_code = serializer.validated_data.get('coupon_code', '')
+    coupon_code    = serializer.validated_data.get('coupon_code', '')
     applied_coupon = None
+
     if coupon_code:
         try:
             from coupons.models import Coupon, CouponUsage
@@ -100,7 +98,7 @@ def create_order(request):
             if coupon.is_valid():
                 user_uses = CouponUsage.objects.filter(coupon=coupon, user=request.user).count()
                 if user_uses < coupon.max_uses_per_user:
-                    discount = coupon.calculate_discount(total)
+                    discount       = coupon.calculate_discount(total)
                     applied_coupon = coupon
         except Coupon.DoesNotExist:
             return Response({'error': f"Coupon '{coupon_code}' not found."}, status=status.HTTP_400_BAD_REQUEST)
@@ -109,7 +107,7 @@ def create_order(request):
 
     # Delivery charge via pincode
     delivery_charge = 0
-    nearest_store = None
+    nearest_store   = None
     try:
         from store_locations.models import ServiceablePincode
         sp = ServiceablePincode.objects.select_related('store').filter(
@@ -117,7 +115,7 @@ def create_order(request):
         ).first()
         if sp:
             delivery_charge = 0 if total >= sp.min_order_for_free_delivery else sp.delivery_charge
-            nearest_store = sp.store
+            nearest_store   = sp.store
         else:
             return Response(
                 {'error': f"Delivery not available to pincode {address.pincode}."},
@@ -152,7 +150,6 @@ def create_order(request):
                 message_on_cake=item.message_on_cake,
             )
 
-        # Record coupon usage
         if applied_coupon and discount > 0:
             from coupons.models import CouponUsage
             CouponUsage.objects.create(
@@ -166,18 +163,14 @@ def create_order(request):
 
         cart.items.all().delete()
 
-    # ── Fire async Celery tasks (non-blocking) ──────────────────────────────
+    # Fire async tasks
     try:
         from orders.tasks import send_order_confirmation, log_order_analytics
-        # Confirmation: email + WhatsApp + push, with retry logic
         send_order_confirmation.delay(order.id, request.user.id)
-        # Analytics: lightweight fire-and-forget
         log_order_analytics.delay(order.id)
     except Exception as e:
-        # Task dispatch failure must NEVER break the order response
         logger.warning(f"Task dispatch failed (non-critical): {e}")
 
-    # Also trigger the generic notification pipeline (WhatsApp/push via notifications app)
     try:
         from notifications.tasks import send_notification_task
         send_notification_task.delay(request.user.id, 'order_placed', {
@@ -186,7 +179,7 @@ def create_order(request):
             'delivery_date': str(order.delivery_date),
         })
     except Exception as e:
-        logger.warning(f"Notification task dispatch failed (non-critical): {e}")
+        logger.warning(f"Notification task dispatch failed: {e}")
 
     logger.info(f"Order #{order.id} created for user #{request.user.id}")
     return Response(OrderSerializer(order).data, status=status.HTTP_201_CREATED)
@@ -221,19 +214,19 @@ def cancel_order(request, pk):
     except Order.DoesNotExist:
         return Response({'error': 'Order not found.'}, status=status.HTTP_404_NOT_FOUND)
 
-    try:
-        with transaction.atomic():
-            order.transition_to('cancelled', performed_by=request.user, notes='Cancelled by customer')
+    if order.status not in ('pending', 'confirmed'):
+        return Response(
+            {'error': f"Cannot cancel an order with status '{order.status}'."},
+            status=status.HTTP_400_BAD_REQUEST
+        )
 
-            # Restore stock
-            try:
-                from products.services import restore_stock_for_order
-                restore_stock_for_order(order, performed_by=request.user)
-            except Exception as e:
-                logger.error(f"Stock restore failed on cancel for order #{order.id}: {e}")
+    with transaction.atomic():
+        order.status = 'cancelled'
+        order.save()
 
-    except ValueError as e:
-        return Response({'error': str(e)}, status=status.HTTP_400_BAD_REQUEST)
+        # Restore stock
+        for item in order.items.select_related('variant').all():
+            item.variant.restore_stock(item.quantity)
 
     try:
         from notifications.tasks import send_notification_task
@@ -241,56 +234,59 @@ def cancel_order(request, pk):
     except Exception:
         pass
 
-    return Response({'message': 'Order cancelled successfully.'})
+    return Response(OrderSerializer(order).data)
 
 
 @api_view(['PATCH'])
 @permission_classes([IsAdminUser])
 def admin_update_order_status(request, pk):
-    """
-    PATCH /api/orders/<pk>/admin-status/
-    Admin-only: transition order to a new status.
-    """
-    new_status = request.data.get('status')
-    notes = request.data.get('notes', '')
-
-    if not new_status:
-        return Response({'error': 'status field required.'}, status=status.HTTP_400_BAD_REQUEST)
-
     try:
         order = Order.objects.get(id=pk)
     except Order.DoesNotExist:
         return Response({'error': 'Order not found.'}, status=status.HTTP_404_NOT_FOUND)
 
-    try:
-        with transaction.atomic():
-            order.transition_to(new_status, performed_by=request.user, notes=notes)
+    new_status = request.data.get('status')
+    if not new_status:
+        return Response({'error': 'status is required.'}, status=status.HTTP_400_BAD_REQUEST)
 
-            # Restore stock on admin-triggered cancellation
-            if new_status == 'cancelled':
-                try:
-                    from products.services import restore_stock_for_order
-                    restore_stock_for_order(order, performed_by=request.user)
-                except Exception as e:
-                    logger.error(f"Stock restore failed: {e}")
+    valid_statuses = ['pending', 'confirmed', 'preparing', 'out_for_delivery', 'delivered', 'cancelled']
+    if new_status not in valid_statuses:
+        return Response(
+            {'error': f"Invalid status. Choose from: {valid_statuses}"},
+            status=status.HTTP_400_BAD_REQUEST
+        )
 
-    except ValueError as e:
-        return Response({'error': str(e)}, status=status.HTTP_400_BAD_REQUEST)
+    old_status = order.status
+    order.status = new_status
+    order.save()
 
-    # Notification map
+    # ── Award loyalty points for COD orders when marked delivered ─────────────
+    # Online payments get points immediately after payment verification.
+    # COD customers get points only after delivery is confirmed.
+    if new_status == 'delivered' and old_status != 'delivered':
+        try:
+            payment = order.payment
+            if payment.method == 'cod':
+                from orders.tasks import award_loyalty_on_delivery
+                award_loyalty_on_delivery.delay(order.id)
+                logger.info(f"Loyalty award queued for COD order #{order.id}")
+        except Exception as e:
+            logger.warning(f"Could not queue loyalty award for order #{order.id}: {e}")
+
+    # Notify customer of status change
     event_map = {
-        'confirmed': 'order_confirmed',
-        'preparing': 'order_preparing',
-        'out_for_delivery': 'order_dispatched',
-        'delivered': 'order_delivered',
-        'cancelled': 'order_cancelled',
+        'confirmed':        'order_confirmed',
+        'preparing':        'order_preparing',
+        'out_for_delivery': 'order_out_for_delivery',
+        'delivered':        'order_delivered',
+        'cancelled':        'order_cancelled',
     }
     if new_status in event_map:
         try:
             from notifications.tasks import send_notification_task
             send_notification_task.delay(order.user_id, event_map[new_status], {
                 'order_id': order.id,
-                'status': new_status,
+                'status':   new_status,
             })
         except Exception:
             pass
