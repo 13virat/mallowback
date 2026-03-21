@@ -5,7 +5,7 @@ from rest_framework.response import Response
 from rest_framework import status
 from .models import Coupon, CouponUsage
 from .serializers import ApplyCouponSerializer, CouponSerializer
-
+from rest_framework.permissions import IsAdminUser
 
 @api_view(['POST'])
 @permission_classes([IsAuthenticated])
@@ -54,3 +54,25 @@ def available_coupons(request):
     coupons = Coupon.objects.filter(is_active=True, valid_from__lte=now, valid_until__gte=now)
     serializer = CouponSerializer(coupons, many=True)
     return Response(serializer.data)
+
+@api_view(['POST'])
+@permission_classes([IsAdminUser])
+def create_coupon(request):
+    data = request.data
+    try:
+        coupon = Coupon.objects.create(
+            code=str(data['code']).upper(),
+            coupon_type=data.get('coupon_type', 'percentage'),
+            discount_value=data['discount_value'],
+            min_order_amount=data.get('min_order_amount', 0),
+            max_discount_amount=data.get('max_discount_amount') or None,
+            max_uses=data.get('max_uses', 100),
+            max_uses_per_user=data.get('max_uses_per_user', 1),
+            valid_from=data['valid_from'],
+            valid_until=data['valid_until'],
+            description=data.get('description', ''),
+            is_active=True,
+        )
+        return Response(CouponSerializer(coupon).data, status=status.HTTP_201_CREATED)
+    except Exception as e:
+        return Response({'error': str(e)}, status=status.HTTP_400_BAD_REQUEST)
