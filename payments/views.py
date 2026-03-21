@@ -1,6 +1,11 @@
 """
 Payment views — Razorpay create, verify, webhook, COD.
 Webhook fully handles: stock deduction, loyalty points, notifications.
+
+LOYALTY POINT RULES:
+- Online (Razorpay): awarded immediately after payment.verify succeeds
+- COD: awarded ONLY after admin marks order as 'delivered'
+  (triggered in orders/views.py::admin_update_order_status)
 """
 import json
 import logging
@@ -37,12 +42,9 @@ def initiate_payment(request, order_id):
     """
     POST /api/payments/initiate/<order_id>/
     Creates Razorpay order. Idempotent — returns existing if already pending.
-    FIX: entire function wrapped in atomic so select_for_update() actually holds
-    the row lock for the duration of the operation.
     """
     with transaction.atomic():
         try:
-            # select_for_update MUST be inside atomic() to hold the lock
             order = Order.objects.select_for_update().get(id=order_id, user=request.user)
         except Order.DoesNotExist:
             return Response({'error': 'Order not found.'}, status=status.HTTP_404_NOT_FOUND)
@@ -105,6 +107,7 @@ def verify_payment(request):
     """
     POST /api/payments/verify/
     Verifies HMAC-SHA256 signature. Idempotent — safe to call twice.
+    Awards loyalty points immediately for online payments.
     """
     serializer = PaymentVerifySerializer(data=request.data)
     if not serializer.is_valid():
@@ -123,19 +126,15 @@ def verify_payment(request):
     except Payment.DoesNotExist:
         return Response({'error': 'Payment record not found.'}, status=status.HTTP_404_NOT_FOUND)
 
-    # Already processed — idempotent response
     if payment.is_paid:
         return Response({'message': 'Payment already verified.', 'order_id': payment.order.id})
 
-    # Timing-safe signature check
     if not verify_razorpay_signature(rz_order_id, rz_payment_id, rz_signature):
         with transaction.atomic():
             payment.status = 'failed'
             payment.failure_reason = 'Invalid signature'
             payment.save()
-        logger.warning(
-            f"Invalid payment signature — order #{payment.order_id} payment {rz_payment_id}"
-        )
+        logger.warning(f"Invalid payment signature — order #{payment.order_id} payment {rz_payment_id}")
         return Response(
             {'error': 'Payment verification failed. Invalid signature.'},
             status=status.HTTP_400_BAD_REQUEST
@@ -150,15 +149,9 @@ def verify_payment(request):
         order = payment.order
         order.transition_to('confirmed', performed_by=request.user, notes='Payment verified')
 
-        # FIX: Stock deduction is now INSIDE the atomic block.
-        # This prevents the double-deduction race where both verify_payment and the
-        # webhook's _handle_payment_captured both call _post_payment_success.
-        # The webhook checks payment.is_paid before acting; with this change,
-        # the stock deduction is committed atomically with payment.status='success',
-        # so the webhook will see is_paid=True and skip stock deduction.
-        _post_payment_success(order, request.user, payment.amount)
+        # Online payment: award loyalty points IMMEDIATELY
+        _post_online_payment_success(order, request.user, payment.amount)
 
-    # Async push notification (outside atomic block — network call should not hold DB lock)
     try:
         from notifications.tasks import send_notification_task
         send_notification_task.delay(request.user.id, 'payment_success', {
@@ -182,6 +175,11 @@ def cod_payment(request, order_id):
     """
     POST /api/payments/cod/<order_id>/
     Mark order as Cash on Delivery.
+
+    IMPORTANT: Loyalty points are NOT awarded here.
+    For COD, points are awarded ONLY when admin marks order as 'delivered'
+    in admin_update_order_status() in orders/views.py.
+    This prevents awarding points for orders that may never be delivered.
     """
     try:
         order = Order.objects.get(id=order_id, user=request.user)
@@ -201,11 +199,18 @@ def cod_payment(request, order_id):
                 'user': request.user,
                 'amount': order.final_amount or order.total_amount,
                 'method': 'cod',
-                'status': 'pending',
+                'status': 'pending',   # stays pending until delivery
             }
         )
         order.transition_to('confirmed', performed_by=request.user, notes='COD confirmed')
-        _post_payment_success(order, request.user, order.final_amount or order.total_amount)
+
+        # ── Stock deduction only — NO loyalty points for COD ──────────────────
+        # Points awarded after delivery in orders/views.py::admin_update_order_status
+        try:
+            from products.services import deduct_stock_for_order
+            deduct_stock_for_order(order)
+        except Exception as e:
+            logger.error(f"Stock deduction failed for COD order #{order.id}: {e}")
 
     try:
         from notifications.tasks import send_notification_task
@@ -216,6 +221,7 @@ def cod_payment(request, order_id):
     except Exception:
         pass
 
+    logger.info(f"COD order #{order.id} confirmed. Loyalty points pending delivery.")
     return Response({'message': 'Order confirmed with Cash on Delivery.', 'order_id': order.id})
 
 
@@ -248,7 +254,6 @@ def razorpay_webhook(request):
                .get('id', '')
     )
 
-    # Idempotency guard
     if PaymentWebhookLog.objects.filter(event_id=event_id, processed=True).exists():
         logger.info(f"Webhook event {event_id} already processed — skipping.")
         return Response({'status': 'already_processed'})
@@ -274,7 +279,6 @@ def razorpay_webhook(request):
 # ── Webhook event handlers ────────────────────────────────────────────────────
 
 def _handle_webhook_event(event_type: str, payload: dict):
-    """Route webhook payload to the correct handler."""
     payment_entity = payload.get('payload', {}).get('payment', {}).get('entity', {})
     refund_entity  = payload.get('payload', {}).get('refund',  {}).get('entity', {})
 
@@ -293,9 +297,9 @@ def _handle_webhook_event(event_type: str, payload: dict):
 
 def _handle_payment_captured(payment_entity: dict):
     """
-    Webhook backup confirmation — fires if the client-side verify call was missed.
-    Fully mirrors what verify_payment() does: confirms order, deducts stock,
-    awards loyalty points, and fires the payment_success notification.
+    Webhook backup for online payments only.
+    Awards loyalty points immediately (same as verify_payment).
+    Never called for COD payments.
     """
     rz_order_id   = payment_entity.get('order_id')
     rz_payment_id = payment_entity.get('id')
@@ -325,9 +329,9 @@ def _handle_payment_captured(payment_entity: dict):
         order = payment.order
         order.transition_to('confirmed', notes='Confirmed via Razorpay webhook')
 
-        _post_payment_success(order, order.user, payment.amount)
+        # Online payment via webhook — award points immediately
+        _post_online_payment_success(order, order.user, payment.amount)
 
-    # Fire async notification from webhook path too
     try:
         from notifications.tasks import send_notification_task
         send_notification_task.delay(order.user_id, 'payment_success', {
@@ -371,11 +375,12 @@ def _handle_refund_created(refund_entity: dict):
 
 # ── Shared post-payment logic ─────────────────────────────────────────────────
 
-def _post_payment_success(order, user, amount):
+def _post_online_payment_success(order, user, amount):
     """
-    Called after both the client verify AND the webhook confirm paths.
-    Deducts stock and awards loyalty points.
-    All errors are caught so they never roll back the payment transaction.
+    Called ONLY for online (Razorpay) payments after successful verification.
+    Deducts stock AND awards loyalty points immediately.
+
+    NOT called for COD — COD points are awarded after delivery in orders/views.py.
     """
     try:
         from products.services import deduct_stock_for_order
@@ -383,8 +388,10 @@ def _post_payment_success(order, user, amount):
     except Exception as e:
         logger.error(f"Stock deduction failed for order #{order.id}: {e}")
 
+    # Award loyalty points immediately for online payment
     try:
         from loyalty.services import award_points_for_payment
-        award_points_for_payment(user, amount, order.id)
+        points = award_points_for_payment(user, amount, order.id)
+        logger.info(f"Awarded {points} loyalty points for online payment — order #{order.id}")
     except Exception as e:
         logger.error(f"Loyalty points failed for order #{order.id}: {e}")

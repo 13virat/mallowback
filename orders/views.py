@@ -1,5 +1,9 @@
 """
 Order views — create, list, cancel, with stock validation and full workflow.
+
+LOYALTY POINT RULES (summary):
+- Online payment: awarded in payments/views.py after verify succeeds
+- COD: awarded HERE when admin marks status → 'delivered'
 """
 import logging
 from django.db import transaction
@@ -79,15 +83,13 @@ def create_order(request):
     if not cart_items.exists():
         return Response({'error': 'Cart is empty.'}, status=status.HTTP_400_BAD_REQUEST)
 
-    # Stock validation
     from products.services import check_cart_stock
     stock_errors = check_cart_stock(cart)
     if stock_errors:
         return Response({'error': 'Stock issues', 'details': stock_errors}, status=status.HTTP_400_BAD_REQUEST)
 
-    # Pricing
-    total    = sum(item.variant.price * item.quantity for item in cart_items)
-    discount = 0
+    total          = sum(item.variant.price * item.quantity for item in cart_items)
+    discount       = 0
     coupon_code    = serializer.validated_data.get('coupon_code', '')
     applied_coupon = None
 
@@ -105,7 +107,7 @@ def create_order(request):
         except Exception as e:
             logger.warning(f"Coupon error: {e}")
 
-    # Delivery charge via pincode
+    # Delivery charge from pincode settings
     delivery_charge = 0
     nearest_store   = None
     try:
@@ -163,23 +165,12 @@ def create_order(request):
 
         cart.items.all().delete()
 
-    # Fire async tasks
     try:
         from orders.tasks import send_order_confirmation, log_order_analytics
         send_order_confirmation.delay(order.id, request.user.id)
         log_order_analytics.delay(order.id)
     except Exception as e:
         logger.warning(f"Task dispatch failed (non-critical): {e}")
-
-    try:
-        from notifications.tasks import send_notification_task
-        send_notification_task.delay(request.user.id, 'order_placed', {
-            'order_id':      order.id,
-            'total':         str(final_amount),
-            'delivery_date': str(order.delivery_date),
-        })
-    except Exception as e:
-        logger.warning(f"Notification task dispatch failed: {e}")
 
     logger.info(f"Order #{order.id} created for user #{request.user.id}")
     return Response(OrderSerializer(order).data, status=status.HTTP_201_CREATED)
@@ -223,8 +214,6 @@ def cancel_order(request, pk):
     with transaction.atomic():
         order.status = 'cancelled'
         order.save()
-
-        # Restore stock
         for item in order.items.select_related('variant').all():
             item.variant.restore_stock(item.quantity)
 
@@ -240,6 +229,14 @@ def cancel_order(request, pk):
 @api_view(['PATCH'])
 @permission_classes([IsAdminUser])
 def admin_update_order_status(request, pk):
+    """
+    Admin endpoint to update order status.
+
+    LOYALTY POINTS FOR COD:
+    When admin changes a COD order status to 'delivered', loyalty points
+    are awarded at that moment. This is the ONLY place COD loyalty points
+    are awarded — never at order creation or COD confirmation.
+    """
     try:
         order = Order.objects.get(id=pk)
     except Order.DoesNotExist:
@@ -260,20 +257,32 @@ def admin_update_order_status(request, pk):
     order.status = new_status
     order.save()
 
-    # ── Award loyalty points for COD orders when marked delivered ─────────────
-    # Online payments get points immediately after payment verification.
-    # COD customers get points only after delivery is confirmed.
+    # ── Award loyalty points for COD orders ONLY on delivery ──────────────────
+    # Online payments: points already awarded in payments/views.py::verify_payment
+    # COD: points awarded here when admin marks as delivered
     if new_status == 'delivered' and old_status != 'delivered':
         try:
             payment = order.payment
             if payment.method == 'cod':
-                from orders.tasks import award_loyalty_on_delivery
-                award_loyalty_on_delivery.delay(order.id)
-                logger.info(f"Loyalty award queued for COD order #{order.id}")
+                from loyalty.services import award_points_for_payment
+                amount = order.final_amount or order.total_amount
+                points = award_points_for_payment(order.user, amount, order.id)
+                # Mark COD payment as complete on delivery
+                payment.status = 'success'
+                payment.save()
+                logger.info(
+                    f"COD order #{order.id} delivered — awarded {points} loyalty points "
+                    f"to user #{order.user_id}"
+                )
+            else:
+                logger.info(
+                    f"Order #{order.id} delivered (online payment) — "
+                    f"loyalty points already awarded at payment time"
+                )
         except Exception as e:
-            logger.warning(f"Could not queue loyalty award for order #{order.id}: {e}")
+            logger.warning(f"Could not award loyalty points for order #{order.id}: {e}")
 
-    # Notify customer of status change
+    # Notify customer
     event_map = {
         'confirmed':        'order_confirmed',
         'preparing':        'order_preparing',
