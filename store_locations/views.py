@@ -5,7 +5,7 @@ from rest_framework import status
 from .models import StoreLocation, ServiceablePincode
 from .serializers import StoreLocationSerializer, ServiceablePincodeSerializer
 from .services import check_pincode_serviceability, get_stores_with_distance
-
+from rest_framework.permissions import IsAdminUser
 
 @api_view(['GET'])
 @permission_classes([AllowAny])
@@ -58,3 +58,26 @@ def store_pincodes(request, pk):
 
     pincodes = store.pincodes.all()
     return Response(ServiceablePincodeSerializer(pincodes, many=True).data)
+
+@api_view(['POST'])
+@permission_classes([IsAdminUser])
+def create_store(request):
+    data = request.data
+    try:
+        store = StoreLocation.objects.create(
+            name=data['name'],
+            address=data['address'],
+            city=data['city'],
+            pincode=data.get('pincode', ''),
+            phone=data['phone'],
+            email=data.get('email', ''),
+            latitude=data.get('latitude') or None,
+            longitude=data.get('longitude') or None,
+            opening_time=data.get('opening_time', '09:00'),
+            closing_time=data.get('closing_time', '21:00'),
+            is_open_sunday=data.get('is_open_sunday', False),
+            is_active=data.get('is_active', True),
+        )
+        return Response(StoreLocationSerializer(store).data, status=status.HTTP_201_CREATED)
+    except Exception as e:
+        return Response({'error': str(e)}, status=status.HTTP_400_BAD_REQUEST)
