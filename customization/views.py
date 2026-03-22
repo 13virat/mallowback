@@ -45,8 +45,41 @@ def update_custom_cake_request(request, pk):
         if 'admin_notes' in request.data:
             req.admin_notes = request.data['admin_notes']
         req.save()
+        # Send notification AFTER save, only when marking as quoted
+        if request.data.get('status') == 'quoted' and req.user:
+            try:
+                from notifications.models import Notification
+                Notification.objects.create(
+                    user=req.user,
+                    title="Your custom cake quote is ready!",
+                    message="We've prepared a quote for your custom cake request. Check it to accept or decline.",
+                    notification_type="custom_cake",
+                )
+            except Exception:
+                pass  # Don't fail the whole request if notification fails
         return Response(CustomCakeSerializer(req, context={'request': request}).data)
     except CustomCakeRequest.DoesNotExist:
         return Response({'error': 'Not found'}, status=404)
     except Exception as e:
         return Response({'error': str(e)}, status=400)
+
+
+@api_view(['PATCH'])
+@permission_classes([IsAuthenticated])
+def respond_to_quote(request, pk):
+    """Customer accepts or rejects a quote."""
+    try:
+        req = CustomCakeRequest.objects.get(id=pk, user=request.user)
+    except CustomCakeRequest.DoesNotExist:
+        return Response({'error': 'Not found.'}, status=404)
+
+    if req.status != 'quoted':
+        return Response({'error': 'Can only respond to quoted requests.'}, status=400)
+
+    response = request.data.get('response')  # 'accepted' or 'rejected'
+    if response not in ('accepted', 'rejected'):
+        return Response({'error': 'response must be accepted or rejected.'}, status=400)
+
+    req.status = response
+    req.save()
+    return Response(CustomCakeSerializer(req, context={'request': request}).data)

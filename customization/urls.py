@@ -4,6 +4,7 @@ from .views import (
     my_custom_cake_requests,
     all_custom_cake_requests,
     update_custom_cake_request,
+    respond_to_quote,
 )
 
 urlpatterns = [
@@ -11,4 +12,5 @@ urlpatterns = [
     path('my-requests/', my_custom_cake_requests, name='my-custom-cakes'),
     path('all/', all_custom_cake_requests, name='all-custom-cakes'),
     path('<int:pk>/update/', update_custom_cake_request, name='update-custom-cake'),
+    path('<int:pk>/respond/', respond_to_quote, name='respond-to-quote'),
 ]
