@@ -91,3 +91,33 @@ def create_store(request):
         return Response(StoreLocationSerializer(store).data, status=status.HTTP_201_CREATED)
     except Exception as e:
         return Response({'error': str(e)}, status=status.HTTP_400_BAD_REQUEST)
+    
+@api_view(['PATCH'])
+@permission_classes([IsAdminUser])
+def update_store(request, pk):
+    try:
+        store = StoreLocation.objects.get(id=pk)
+        data = request.data
+        for field in ['name','address','city','pincode','phone','email','opening_time','closing_time','is_open_sunday','is_active']:
+            if field in data:
+                setattr(store, field, data[field])
+        store.latitude = data.get('latitude') or None
+        store.longitude = data.get('longitude') or None
+        store.save()
+        # Replace pincodes
+        if 'pincodes' in data:
+            store.pincodes.all().delete()
+            for p in data['pincodes']:
+                if p.get('pincode'):
+                    ServiceablePincode.objects.create(
+                        store=store,
+                        pincode=p['pincode'],
+                        delivery_charge=p.get('delivery_charge', 0),
+                        min_order_for_free_delivery=p.get('min_order_for_free_delivery', 0),
+                        estimated_delivery_time=p.get('estimated_delivery_time', '2-4 hours'),
+                    )
+        return Response(StoreLocationSerializer(store).data)
+    except StoreLocation.DoesNotExist:
+        return Response({'error': 'Not found'}, status=404)
+    except Exception as e:
+        return Response({'error': str(e)}, status=400)    
