@@ -301,3 +301,31 @@ def admin_update_order_status(request, pk):
             pass
 
     return Response(OrderSerializer(order).data)
+@api_view(['GET'])
+@permission_classes([IsAdminUser])
+def admin_all_orders(request):
+    """
+    Admin: list ALL orders with optional filters.
+    ?type=normal|custom
+    ?status=pending|confirmed|preparing|out_for_delivery|delivered|cancelled
+    """
+    orders = Order.objects.select_related(
+        'user', 'address', 'custom_cake_request'
+    ).prefetch_related('items__product', 'items__variant', 'history').all()
+
+    order_type = request.query_params.get('type')
+    if order_type in ('normal', 'custom'):
+        orders = orders.filter(order_type=order_type)
+
+    order_status = request.query_params.get('status')
+    if order_status:
+        orders = orders.filter(status=order_status)
+
+    data = []
+    for order in orders:
+        d = OrderSerializer(order, context={'request': request}).data
+        d['user_name'] = order.user.get_full_name() or order.user.username or order.user.email
+        d['user_email'] = order.user.email
+        data.append(d)
+
+    return Response(data)
