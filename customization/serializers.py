@@ -4,6 +4,8 @@ from .models import CustomCakeRequest
 
 class CustomCakeSerializer(serializers.ModelSerializer):
     status_display = serializers.CharField(source='get_status_display', read_only=True)
+    # use_url=True builds a full absolute URL using the request context
+    reference_image = serializers.ImageField(use_url=True, required=False, allow_null=True)
 
     class Meta:
         model = CustomCakeRequest
