@@ -301,6 +301,7 @@ def admin_update_order_status(request, pk):
             pass
 
     return Response(OrderSerializer(order).data)
+
 @api_view(['GET'])
 @permission_classes([IsAdminUser])
 def admin_all_orders(request):
@@ -321,11 +322,22 @@ def admin_all_orders(request):
     if order_status:
         orders = orders.filter(status=order_status)
 
+    # Annotate user info for display
+    from .serializers import OrderSerializer
     data = []
     for order in orders:
         d = OrderSerializer(order, context={'request': request}).data
         d['user_name'] = order.user.get_full_name() or order.user.username or order.user.email
         d['user_email'] = order.user.email
+        # Include payment info for advance payment display
+        try:
+            p = order.payment
+            d['payment_method']   = p.method
+            d['advance_amount']   = float(p.advance_amount)
+            d['remaining_amount'] = float(p.remaining_amount)
+            d['remaining_paid']   = p.remaining_paid
+        except Exception:
+            d['payment_method'] = None
         data.append(d)
 
     return Response(data)

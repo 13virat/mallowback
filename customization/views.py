@@ -180,12 +180,36 @@ def respond_to_quote(request, pk):
     req.status = response
     req.save()
 
-    # If customer accepted, create the order
+    # If customer accepted, create the order and return payment info
     if response == 'accepted':
-        if not hasattr(req, 'order') or req.order is None:
+        order = None
+        # Check if order already exists
+        try:
+            order = req.order
+        except Exception:
+            pass
+
+        if order is None:
             try:
-                _create_order_from_custom_cake(req)
+                order = _create_order_from_custom_cake(req)
             except Exception as e:
                 logger.error(f"Order creation failed on customer accept, req #{req.id}: {e}")
+
+        if order:
+            total = float(order.final_amount or order.total_amount)
+            advance = round(total * 0.5, 2)
+            remaining = round(total - advance, 2)
+            data = CustomCakeSerializer(req, context={'request': request}).data
+            data['order_id'] = order.id
+            data['payment'] = {
+                'total_amount':     total,
+                'advance_amount':   advance,
+                'remaining_amount': remaining,
+                'advance_percent':  50,
+                'initiate_url':     f'/api/payments/advance/{order.id}/',
+                'verify_url':       '/api/payments/advance/verify/',
+                'message':          f'Pay ₹{advance:.0f} now (50% advance) to confirm your order. ₹{remaining:.0f} due on delivery.',
+            }
+            return Response(data)
 
     return Response(CustomCakeSerializer(req, context={'request': request}).data)

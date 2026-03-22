@@ -395,3 +395,221 @@ def _post_online_payment_success(order, user, amount):
         logger.info(f"Awarded {points} loyalty points for online payment — order #{order.id}")
     except Exception as e:
         logger.error(f"Loyalty points failed for order #{order.id}: {e}")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CUSTOM CAKE ADVANCE PAYMENT
+# ─────────────────────────────────────────────────────────────────────────────
+
+@api_view(['POST'])
+@permission_classes([IsAuthenticated])
+def initiate_advance_payment(request, order_id):
+    """
+    POST /api/payments/advance/<order_id>/
+    Creates a Razorpay order for 50% advance on a custom cake order.
+    Returns razorpay_order_id + amount (50% of total) for frontend to open Razorpay.
+    """
+    try:
+        order = Order.objects.get(id=order_id, user=request.user)
+    except Order.DoesNotExist:
+        return Response({'error': 'Order not found.'}, status=status.HTTP_404_NOT_FOUND)
+
+    if order.order_type != 'custom':
+        return Response({'error': 'Advance payment is only for custom cake orders.'}, status=400)
+
+    if hasattr(order, 'payment') and order.payment.is_paid:
+        return Response({'error': 'Advance already paid.'}, status=400)
+
+    total     = float(order.final_amount or order.total_amount)
+    advance   = round(total * 0.5, 2)   # 50%
+    remaining = round(total - advance, 2)
+
+    # Idempotency — return existing if already initiated
+    if hasattr(order, 'payment') and order.payment.razorpay_order_id:
+        p = order.payment
+        if p.status in ('initiated', 'pending'):
+            return Response({
+                'razorpay_order_id': p.razorpay_order_id,
+                'advance_amount':    int(p.advance_amount * 100),
+                'remaining_amount':  float(p.remaining_amount),
+                'total_amount':      float(total),
+                'currency':          'INR',
+                'key':               settings.RAZORPAY_KEY_ID,
+                'order_id':          order.id,
+            })
+
+    try:
+        rz_order = create_razorpay_order(order.id, advance)
+    except Exception as e:
+        logger.error(f"Advance payment initiation failed for order #{order_id}: {e}")
+        return Response({'error': 'Payment gateway error. Please try again.'}, status=502)
+
+    idempotency_key = generate_idempotency_key(order.id)
+    Payment.objects.update_or_create(
+        order=order,
+        defaults={
+            'user':              request.user,
+            'method':            'custom_advance',
+            'status':            'initiated',
+            'amount':            total,         # full order amount
+            'advance_amount':    advance,        # 50% — what's being paid now
+            'remaining_amount':  remaining,      # 50% — due on delivery
+            'razorpay_order_id': rz_order['id'],
+            'idempotency_key':   idempotency_key,
+            'gateway_response':  rz_order,
+        }
+    )
+
+    logger.info(f"Advance payment initiated: order #{order_id}, advance ₹{advance}, remaining ₹{remaining}")
+    return Response({
+        'razorpay_order_id': rz_order['id'],
+        'advance_amount':    int(advance * 100),   # paise for Razorpay
+        'remaining_amount':  remaining,
+        'total_amount':      total,
+        'currency':          'INR',
+        'key':               settings.RAZORPAY_KEY_ID,
+        'order_id':          order.id,
+    })
+
+
+@api_view(['POST'])
+@permission_classes([IsAuthenticated])
+def verify_advance_payment(request):
+    """
+    POST /api/payments/advance/verify/
+    Verifies Razorpay signature for advance payment.
+    Marks order as confirmed with advance_paid status.
+    Awards HALF loyalty points now, rest on delivery.
+    """
+    serializer = PaymentVerifySerializer(data=request.data)
+    if not serializer.is_valid():
+        return Response(serializer.errors, status=400)
+
+    data = serializer.validated_data
+    rz_order_id   = data['razorpay_order_id']
+    rz_payment_id = data['razorpay_payment_id']
+    rz_signature  = data['razorpay_signature']
+
+    try:
+        payment = Payment.objects.select_related('order').get(
+            razorpay_order_id=rz_order_id,
+            user=request.user,
+            method='custom_advance',
+        )
+    except Payment.DoesNotExist:
+        return Response({'error': 'Payment record not found.'}, status=404)
+
+    if payment.is_paid:
+        return Response({
+            'message':          'Advance already verified.',
+            'order_id':         payment.order.id,
+            'remaining_amount': float(payment.remaining_amount),
+        })
+
+    if not verify_razorpay_signature(rz_order_id, rz_payment_id, rz_signature):
+        payment.status = 'failed'
+        payment.failure_reason = 'Invalid signature'
+        payment.save()
+        logger.warning(f"Invalid advance payment signature — order #{payment.order_id}")
+        return Response({'error': 'Payment verification failed. Invalid signature.'}, status=400)
+
+    with transaction.atomic():
+        payment.razorpay_payment_id = rz_payment_id
+        payment.razorpay_signature  = rz_signature
+        payment.status = 'success'
+        payment.save()
+
+        order = payment.order
+        # Transition to preparing — advance paid, bakery can start
+        if order.status == 'confirmed':
+            order.transition_to(
+                'preparing',
+                performed_by=request.user,
+                notes=f'50% advance of ₹{payment.advance_amount} paid. Remaining ₹{payment.remaining_amount} due on delivery.'
+            )
+
+        # Award loyalty points for advance amount only (half now, half on delivery)
+        try:
+            from loyalty.services import award_points_for_payment
+            points = award_points_for_payment(request.user, payment.advance_amount, order.id)
+            logger.info(f"Awarded {points} loyalty points for advance — order #{order.id}")
+        except Exception as e:
+            logger.error(f"Loyalty points failed for advance order #{order.id}: {e}")
+
+    # Notify customer
+    try:
+        from notifications.models import Notification
+        Notification.objects.create(
+            user=request.user,
+            title="Advance payment confirmed! 🎂",
+            message=(
+                f"₹{payment.advance_amount} advance received for your custom cake. "
+                f"We're now preparing your cake! ₹{payment.remaining_amount} due on delivery."
+            ),
+            notification_type="payment",
+        )
+    except Exception:
+        pass
+
+    logger.info(f"Advance payment verified: order #{order.id}, advance ₹{payment.advance_amount}")
+    return Response({
+        'message':          'Advance payment verified. Bakery is now preparing your cake!',
+        'order_id':         order.id,
+        'advance_paid':     float(payment.advance_amount),
+        'remaining_amount': float(payment.remaining_amount),
+        'remaining_due':    'on delivery',
+    })
+
+
+@api_view(['POST'])
+@permission_classes([IsAuthenticated])
+def mark_remaining_paid(request, order_id):
+    """
+    POST /api/payments/advance/<order_id>/mark-paid/
+    Admin marks the remaining 50% as collected on delivery.
+    Awards remaining loyalty points.
+    """
+    from rest_framework.permissions import IsAdminUser
+    if not request.user.is_staff:
+        return Response({'error': 'Admin only.'}, status=403)
+
+    try:
+        order = Order.objects.get(id=order_id)
+        payment = order.payment
+    except (Order.DoesNotExist, Payment.DoesNotExist):
+        return Response({'error': 'Order or payment not found.'}, status=404)
+
+    if not payment.is_custom_advance:
+        return Response({'error': 'Not a custom advance payment.'}, status=400)
+
+    if payment.remaining_paid:
+        return Response({'message': 'Remaining amount already marked as paid.'})
+
+    payment.remaining_paid = True
+    payment.save()
+
+    # Award remaining loyalty points
+    try:
+        from loyalty.services import award_points_for_payment
+        points = award_points_for_payment(order.user, payment.remaining_amount, order.id)
+        logger.info(f"Awarded {points} remaining loyalty points — order #{order.id}")
+    except Exception as e:
+        logger.error(f"Remaining loyalty points failed — order #{order.id}: {e}")
+
+    # Notify customer
+    try:
+        from notifications.models import Notification
+        Notification.objects.create(
+            user=order.user,
+            title="Full payment received! 🎂",
+            message=f"₹{payment.remaining_amount} balance received. Thank you!",
+            notification_type="payment",
+        )
+    except Exception:
+        pass
+
+    return Response({
+        'message':          'Remaining payment marked as collected.',
+        'advance_paid':     float(payment.advance_amount),
+        'remaining_paid':   float(payment.remaining_amount),
+        'total_paid':       float(payment.amount),
+    })
