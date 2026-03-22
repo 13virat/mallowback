@@ -4,7 +4,7 @@ from rest_framework.response import Response
 from rest_framework import status
 from .models import LoyaltyAccount
 from .serializers import LoyaltyAccountSerializer
-
+from rest_framework.permissions import IsAdminUser
 
 @api_view(['GET'])
 @permission_classes([IsAuthenticated])
@@ -31,3 +31,17 @@ def redeem_points(request):
         'discount_applied': discount,
         'remaining_points': account.points,
     })
+
+@api_view(['GET'])
+@permission_classes([IsAdminUser])
+def all_loyalty_accounts(request):
+    from .models import LoyaltyAccount
+    accounts = LoyaltyAccount.objects.select_related('user').prefetch_related('transactions').all()
+    data = []
+    for acc in accounts:
+        d = LoyaltyAccountSerializer(acc).data
+        d['user_email'] = acc.user.email
+        d['user_name'] = f"{acc.user.first_name} {acc.user.last_name}".strip()
+        d['id'] = acc.id
+        data.append(d)
+    return Response(data)
