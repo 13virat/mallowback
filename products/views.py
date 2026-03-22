@@ -147,3 +147,79 @@ def adjust_stock(request, pk):
         'stock_after': stock_after,
         'quantity_added': quantity,
     })
+
+
+@api_view(['PATCH'])
+@permission_classes([IsAdminUser])
+def update_product(request, pk):
+    import json
+    try:
+        product = Product.objects.get(id=pk)
+        data = request.data
+        for f in ['name','description','is_eggless','is_available','is_featured']:
+            if f in data:
+                val = data[f]
+                if f in ['is_eggless','is_available','is_featured']:
+                    val = val in [True,'true','True']
+                setattr(product, f, val)
+        if 'category' in data:
+            product.category_id = data['category']
+        if 'image' in request.FILES:
+            product.image = request.FILES['image']
+        product.save()
+        variants_raw = data.get('variants')
+        if variants_raw:
+            variants = json.loads(variants_raw) if isinstance(variants_raw, str) else variants_raw
+            for v in variants:
+                if v.get('id'):
+                    ProductVariant.objects.filter(id=v['id']).update(
+                        weight=v['weight'], price=v['price'], stock=v.get('stock',0),
+                        low_stock_threshold=v.get('low_stock_threshold',5),
+                        is_available=v.get('is_available',True),
+                    )
+                else:
+                    ProductVariant.objects.create(product=product, weight=v['weight'],
+                        price=v['price'], stock=v.get('stock',0),
+                        low_stock_threshold=v.get('low_stock_threshold',5),
+                        is_available=v.get('is_available',True), track_inventory=True)
+        return Response(ProductSerializer(product, context={'request': request}).data)
+    except Product.DoesNotExist:
+        return Response({'error': 'Not found'}, status=404)
+    except Exception as e:
+        return Response({'error': str(e)}, status=400)
+
+
+@api_view(['PATCH'])
+@permission_classes([IsAdminUser])
+def update_category(request, pk):
+    try:
+        from django.utils.text import slugify
+        cat = Category.objects.get(id=pk)
+        data = request.data
+        if 'name' in data: cat.name = data['name']
+        if 'slug' in data: cat.slug = data['slug'] or slugify(data.get('name', cat.name))
+        if 'description' in data: cat.description = data['description']
+        if 'image' in request.FILES: cat.image = request.FILES['image']
+        cat.save()
+        return Response(CategorySerializer(cat, context={'request': request}).data)
+    except Category.DoesNotExist:
+        return Response({'error': 'Not found'}, status=404)
+    except Exception as e:
+        return Response({'error': str(e)}, status=400)
+
+
+@api_view(['PATCH'])
+@permission_classes([IsAdminUser])
+def update_variant(request, pk):
+    try:
+        v = ProductVariant.objects.get(id=pk)
+        data = request.data
+        for f in ['weight','price','stock','low_stock_threshold','is_available','track_inventory']:
+            if f in data:
+                setattr(v, f, data[f])
+        v.save()
+        return Response({'id': v.id, 'weight': v.weight, 'price': str(v.price), 'stock': v.stock})
+    except ProductVariant.DoesNotExist:
+        return Response({'error': 'Not found'}, status=404)
+    except Exception as e:
+        return Response({'error': str(e)}, status=400)
