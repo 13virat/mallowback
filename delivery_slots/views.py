@@ -10,6 +10,8 @@ from rest_framework import status
 from .models import DeliverySlot, SlotBooking
 from .serializers import DeliverySlotSerializer, SlotBookingSerializer
 
+from rest_framework.permissions import IsAdminUser
+
 
 @api_view(['GET'])
 @permission_classes([AllowAny])
@@ -149,3 +151,48 @@ def cancel_booking(request, pk):
 
     booking.delete()
     return Response({'message': 'Slot booking cancelled.'}, status=status.HTTP_204_NO_CONTENT)
+
+@api_view(['GET'])
+@permission_classes([IsAdminUser])
+def all_slots(request):
+    """Admin: list all slots (active + inactive)"""
+    slots = DeliverySlot.objects.all()
+    return Response(DeliverySlotSerializer(slots, many=True).data)
+
+@api_view(['POST'])
+@permission_classes([IsAdminUser])
+def create_slot(request):
+    data = request.data
+    try:
+        slot = DeliverySlot.objects.create(
+            label=data['label'], start_time=data['start_time'],
+            end_time=data['end_time'], max_orders=data.get('max_orders', 10),
+            extra_charge=data.get('extra_charge', 0),
+            available_days=data.get('available_days', list(range(7))),
+            is_active=data.get('is_active', True),
+        )
+        return Response(DeliverySlotSerializer(slot).data, status=201)
+    except Exception as e:
+        return Response({'error': str(e)}, status=400)
+
+@api_view(['PATCH'])
+@permission_classes([IsAdminUser])
+def update_slot(request, pk):
+    try:
+        slot = DeliverySlot.objects.get(id=pk)
+        for f in ['label','start_time','end_time','max_orders','extra_charge','available_days','is_active']:
+            if f in request.data:
+                setattr(slot, f, request.data[f])
+        slot.save()
+        return Response(DeliverySlotSerializer(slot).data)
+    except DeliverySlot.DoesNotExist:
+        return Response({'error': 'Not found'}, status=404)
+    except Exception as e:
+        return Response({'error': str(e)}, status=400)
+
+@api_view(['GET'])
+@permission_classes([IsAdminUser])
+def all_bookings(request):
+    """Admin: list all slot bookings across all users"""
+    bookings = SlotBooking.objects.select_related('slot','order').order_by('-delivery_date')
+    return Response(SlotBookingSerializer(bookings, many=True).data)
