@@ -64,6 +64,7 @@ def create_category(request):
             name=data['name'],
             slug=data.get('slug') or slugify(data['name']),
             description=data.get('description', ''),
+            image=request.FILES.get('image') or None,
         )
         return Response(CategorySerializer(category, context={'request': request}).data, status=201)
     except Exception as e:
@@ -75,16 +76,19 @@ def create_category(request):
 def create_product(request):
     data = request.data
     try:
+        import json
         product = Product.objects.create(
             name=data['name'],
             category_id=data['category'],
             description=data.get('description', ''),
-            is_eggless=data.get('is_eggless', True),
-            is_available=data.get('is_available', True),
-            is_featured=data.get('is_featured', False),
-            image=data.get('image', '') or '',
+            is_eggless=data.get('is_eggless', 'true') in [True, 'true', 'True'],
+            is_available=data.get('is_available', 'true') in [True, 'true', 'True'],
+            is_featured=data.get('is_featured', 'false') in [True, 'true', 'True'],
+            image=request.FILES.get('image') or '',
         )
-        for v in data.get('variants', []):
+        variants_raw = data.get('variants', '[]')
+        variants = json.loads(variants_raw) if isinstance(variants_raw, str) else variants_raw
+        for v in variants:
             ProductVariant.objects.create(
                 product=product,
                 weight=v['weight'],
