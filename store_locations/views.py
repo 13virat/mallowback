@@ -78,6 +78,16 @@ def create_store(request):
             is_open_sunday=data.get('is_open_sunday', False),
             is_active=data.get('is_active', True),
         )
+        # Create serviceable pincodes if provided
+        for p in data.get('pincodes', []):
+            if p.get('pincode'):
+                ServiceablePincode.objects.create(
+                    store=store,
+                    pincode=p['pincode'],
+                    delivery_charge=p.get('delivery_charge', 0),
+                    min_order_for_free_delivery=p.get('min_order_for_free_delivery', 0),
+                    estimated_delivery_time=p.get('estimated_delivery_time', '2-4 hours'),
+                )
         return Response(StoreLocationSerializer(store).data, status=status.HTTP_201_CREATED)
     except Exception as e:
         return Response({'error': str(e)}, status=status.HTTP_400_BAD_REQUEST)
