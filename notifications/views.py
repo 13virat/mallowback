@@ -153,3 +153,105 @@ def send_broadcast(request):
         'sent':    sent,
         'total':   count,
     })
+
+# ── Campaign endpoints ────────────────────────────────────────────────────────
+
+@api_view(['GET'])
+@permission_classes([IsAdminUser])
+def list_campaigns(request):
+    from .models import Campaign
+    from .serializers import CampaignSerializer
+    campaigns = Campaign.objects.all()
+    return Response(CampaignSerializer(campaigns, many=True).data)
+
+
+@api_view(['POST'])
+@permission_classes([IsAdminUser])
+def create_campaign(request):
+    from .models import Campaign
+    from .serializers import CampaignSerializer
+    serializer = CampaignSerializer(data=request.data)
+    if serializer.is_valid():
+        serializer.save(created_by=request.user)
+        return Response(serializer.data, status=201)
+    return Response(serializer.errors, status=400)
+
+
+@api_view(['GET', 'PATCH'])
+@permission_classes([IsAdminUser])
+def campaign_detail(request, pk):
+    from .models import Campaign
+    from .serializers import CampaignSerializer
+    try:
+        campaign = Campaign.objects.get(id=pk)
+    except Campaign.DoesNotExist:
+        return Response({'error': 'Not found'}, status=404)
+
+    if request.method == 'GET':
+        return Response(CampaignSerializer(campaign).data)
+
+    serializer = CampaignSerializer(campaign, data=request.data, partial=True)
+    if serializer.is_valid():
+        serializer.save()
+        return Response(serializer.data)
+    return Response(serializer.errors, status=400)
+
+
+@api_view(['POST'])
+@permission_classes([IsAdminUser])
+def send_campaign_now(request, pk):
+    """Trigger campaign send immediately in background thread."""
+    from .models import Campaign
+    from .serializers import CampaignSerializer
+    from .campaign_services import execute_campaign
+    from core.thread_tasks import run_async
+
+    try:
+        campaign = Campaign.objects.get(id=pk)
+    except Campaign.DoesNotExist:
+        return Response({'error': 'Not found'}, status=404)
+
+    if campaign.status == 'sending':
+        return Response({'error': 'Campaign is already sending.'}, status=400)
+
+    # Run in background so API returns immediately
+    run_async(execute_campaign, campaign.id)
+
+    return Response({
+        'message': f'Campaign "{campaign.name}" started sending.',
+        'campaign_id': campaign.id,
+    })
+
+
+@api_view(['GET'])
+@permission_classes([IsAdminUser])
+def run_birthday_campaigns_now(request):
+    """Manually trigger birthday campaigns for today (for testing)."""
+    from .models import Campaign
+    from .campaign_services import execute_campaign
+    from core.thread_tasks import run_async
+    from datetime import date
+
+    today = date.today()
+    birthday_campaigns = Campaign.objects.filter(campaign_type='birthday', status='draft')
+    count = birthday_campaigns.count()
+
+    if count == 0:
+        return Response({'message': 'No birthday campaigns configured. Create one first.'})
+
+    from django.contrib.auth import get_user_model
+    User = get_user_model()
+    birthday_users = User.objects.filter(
+        is_active=True,
+        date_of_birth__month=today.month,
+        date_of_birth__day=today.day,
+    ).count()
+
+    for campaign in birthday_campaigns:
+        run_async(execute_campaign, campaign.id)
+
+    return Response({
+        'message': f'Triggered {count} birthday campaign(s) for {birthday_users} users with birthday today ({today}).',
+        'campaigns': count,
+        'birthday_users_today': birthday_users,
+    })

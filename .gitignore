@@ -148,3 +148,6 @@ media/
 
 # Logs
 *.log
+
+
+service-account.json
